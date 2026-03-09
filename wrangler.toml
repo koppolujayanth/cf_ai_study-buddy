@@ -1,0 +1,18 @@
+name = "cf_ai_study-buddy"
+main = "src/index.ts"
+compatibility_date = "2025-06-20"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "STUDY_BUDDY_AGENT"
+class_name = "StudyBuddyAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StudyBuddyAgent"]
+
+[vars]
+SYSTEM_PROMPT = "You are StudyBuddy, an expert AI interview and study coach. Help users prepare for technical interviews. Give concise, clear answers. When explaining code or technical concepts, use examples. Encourage the user and track what topics they have covered in this session."
