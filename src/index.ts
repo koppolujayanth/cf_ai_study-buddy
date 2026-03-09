@@ -7,100 +7,78 @@ export interface Env {
 }
 
 // ─── Durable Object ───────────────────────────────────────────────────────────
-// Stores full conversation history in memory (persists while DO is alive).
-// Handles WebSocket connections for real-time streaming chat.
 
 export class StudyBuddyAgent implements DurableObject {
-  private sessions: Map<WebSocket, { messages: { role: string; content: string }[] }> = new Map();
-  private history: { role: string; content: string }[] = [];
+  private history: { role: "user" | "assistant"; content: string }[] = [];
 
   constructor(private state: DurableObjectState, private env: Env) {
-    // Restore history from storage on cold start
     this.state.blockConcurrencyWhile(async () => {
-      const saved = await this.state.storage.get<{ role: string; content: string }[]>("history");
+      const saved = await this.state.storage.get<{ role: "user" | "assistant"; content: string }[]>("history");
       if (saved) this.history = saved;
     });
   }
 
   async fetch(request: Request): Promise<Response> {
     const upgrade = request.headers.get("Upgrade");
-    if (upgrade === "websocket") {
+    if (upgrade?.toLowerCase() === "websocket") {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.state.acceptWebSocket(server);
-      this.sessions.set(server, { messages: [] });
-
-      // Send existing history to new client
+      // Send history on connect
       server.send(JSON.stringify({ type: "history", messages: this.history }));
-
       return new Response(null, { status: 101, webSocket: client });
     }
     return new Response("Expected WebSocket", { status: 400 });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+  async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer) {
     try {
-      const data = JSON.parse(message as string);
+      const data = JSON.parse(raw as string);
       if (data.type !== "chat") return;
 
-      const userMsg = { role: "user", content: data.content };
+      const userMsg: { role: "user" | "assistant"; content: string } = {
+        role: "user",
+        content: data.content,
+      };
       this.history.push(userMsg);
 
-      // Stream response from Llama 3.3
-      const stream = await (this.env.AI as any).run(
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      const messages = [
         {
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are StudyBuddy, an expert AI interview coach for software engineers. Help users prepare for technical interviews. Give concise, clear answers. Use examples for technical concepts. Be encouraging.",
-            },
-            ...this.history,
-          ],
-          stream: true,
-        }
-      );
+          role: "system" as const,
+          content:
+            "You are StudyBuddy, an expert AI interview coach for software engineers. Help users prepare for technical interviews. Give clear, concise answers with examples. Be encouraging and supportive.",
+        },
+        ...this.history,
+      ];
 
-      let fullText = "";
-      const reader = stream.getReader ? stream.getReader() : (stream as any);
+      // Use non-streaming for reliability
+      const response = await (this.env.AI as any).run(
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        { messages }
+      ) as { response: string };
 
-      if (stream.getReader) {
-        const r = stream.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await r.read();
-          if (done) break;
-          const chunk = decoder.decode(value);
-          // Parse SSE lines
-          for (const line of chunk.split("\n")) {
-            if (line.startsWith("data: ") && line !== "data: [DONE]") {
-              try {
-                const json = JSON.parse(line.slice(6));
-                const delta = json?.response ?? "";
-                if (delta) {
-                  fullText += delta;
-                  ws.send(JSON.stringify({ type: "delta", text: delta }));
-                }
-              } catch {}
-            }
-          }
-        }
-      }
+      const reply = response?.response ?? "Sorry, I could not generate a response.";
 
+      // Send as delta then done (keeps client code working)
+      ws.send(JSON.stringify({ type: "delta", text: reply }));
       ws.send(JSON.stringify({ type: "done" }));
 
-      // Save assistant reply to history
-      this.history.push({ role: "assistant", content: fullText });
+      this.history.push({ role: "assistant", content: reply });
+
+      // Keep history to last 20 messages to avoid token limits
+      if (this.history.length > 20) {
+        this.history = this.history.slice(-20);
+      }
+
       await this.state.storage.put("history", this.history);
-    } catch (err) {
-      ws.send(JSON.stringify({ type: "error", text: "Something went wrong. Please try again." }));
+    } catch (err: any) {
+      console.error("AI error:", err);
+      ws.send(JSON.stringify({ type: "error", text: "AI error: " + (err?.message ?? "unknown") }));
     }
   }
 
-  async webSocketClose(ws: WebSocket) {
-    this.sessions.delete(ws);
-  }
+  async webSocketClose(ws: WebSocket) {}
+  async webSocketError(ws: WebSocket) {}
 }
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
@@ -202,13 +180,16 @@ Ask me anything — Java, Spring Boot, React, Kafka, system design — or say "q
     ws.onclose=()=>{on=false;setTimeout(conn,2000)};
     ws.onerror=()=>ws.close();
     ws.onmessage=(e)=>{
-      const d=JSON.parse(e.data);
-      if(d.type==='history'){
-        d.messages.forEach(m=>addB(m.role==='user'?'user':'ai',m.content));
-      }
-      if(d.type==='delta'){text+=d.text;if(bubble)bubble.textContent=text;sc()}
-      if(d.type==='done'){bubble=null;text='';rmTyping();document.getElementById('btn').disabled=false}
-      if(d.type==='error'){bubble=null;text='';rmTyping();addB('ai',d.text);document.getElementById('btn').disabled=false}
+      try{
+        const d=JSON.parse(e.data);
+        if(d.type==='history'){
+          document.getElementById('chat').innerHTML='<div class="msg ai"><span class="label">StudyBuddy</span><div class="bubble">👋 Hi! I\'m your AI interview coach powered by Llama 3.3 on Cloudflare.\\nAsk me anything — Java, Spring Boot, React, Kafka, system design — or say \\"quiz me\\"!</div></div>';
+          d.messages.forEach(m=>addB(m.role==='user'?'user':'ai',m.content));
+        }
+        if(d.type==='delta'){text+=d.text;if(bubble)bubble.textContent=text;sc()}
+        if(d.type==='done'){bubble=null;text='';rmTyping();document.getElementById('btn').disabled=false}
+        if(d.type==='error'){bubble=null;text='';rmTyping();addB('ai','⚠️ '+d.text);document.getElementById('btn').disabled=false}
+      }catch(err){console.error(err)}
     };
   }
   conn();
@@ -221,9 +202,25 @@ Ask me anything — Java, Spring Boot, React, Kafka, system design — or say "q
     ws.send(JSON.stringify({type:'chat',content:t}));
   }
   function qs(t){document.getElementById('inp').value=t;send();document.getElementById('chips').style.display='none'}
-  function addB(r,t){const c=document.getElementById('chat');const m=document.createElement('div');m.className='msg '+r;m.innerHTML='<span class="label">'+(r==='user'?'You':'StudyBuddy')+'</span><div class="bubble">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>';c.appendChild(m);sc()}
-  function mkB(){const c=document.getElementById('chat');const m=document.createElement('div');m.className='msg ai';const l=document.createElement('span');l.className='label';l.textContent='StudyBuddy';const b=document.createElement('div');b.className='bubble';m.appendChild(l);m.appendChild(b);c.appendChild(m);sc();return b}
-  function showTyping(){const c=document.getElementById('chat');const t=document.createElement('div');t.className='msg ai';t.id='typ';t.innerHTML='<div class="bubble typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';c.appendChild(t);sc()}
+  function addB(r,t){
+    const c=document.getElementById('chat');
+    const m=document.createElement('div');m.className='msg '+r;
+    m.innerHTML='<span class="label">'+(r==='user'?'You':'StudyBuddy')+'</span><div class="bubble">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\n/g,'<br>')+'</div>';
+    c.appendChild(m);sc();
+  }
+  function mkB(){
+    const c=document.getElementById('chat');
+    const m=document.createElement('div');m.className='msg ai';
+    const l=document.createElement('span');l.className='label';l.textContent='StudyBuddy';
+    const b=document.createElement('div');b.className='bubble';
+    m.appendChild(l);m.appendChild(b);c.appendChild(m);sc();return b;
+  }
+  function showTyping(){
+    const c=document.getElementById('chat');
+    const t=document.createElement('div');t.className='msg ai';t.id='typ';
+    t.innerHTML='<div class="bubble typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';
+    c.appendChild(t);sc();
+  }
   function rmTyping(){const t=document.getElementById('typ');if(t)t.remove()}
   function sc(){const c=document.getElementById('chat');c.scrollTop=c.scrollHeight}
   function resize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,140)+'px'}
