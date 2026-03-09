@@ -4,14 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "cf-typegen": "wrangler types"
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "agents": "^0.0.74",
-    "ai": "^4.3.16",
-    "hono": "^4.7.10",
-    "workers-ai-provider": "^0.4.0"
+    "hono": "^4.7.10"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250620.0",
